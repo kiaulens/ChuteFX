@@ -59,7 +59,8 @@ namespace ChuteFX
         public static int ropeSegments = 20;
         public static float bendStiffness = 0.2f;
         public static bool tetherOnLanding = true;      // cut after landing: the riser stays attached to the part
-        public static float lineGray = 0.78f;           // brightness of the lines (0 = black, 1 = white)
+        public static float lineGray = 0.78f;           // brightness of the lines when their colour cannot be read (0 = black, 1 = white)
+        public static bool lineColorAuto = true;        // ropes take the colour of the original lines (from the canopy texture)
         public static float settleMax = 25f;            // s after ground contact; at the latest then the canopy comes to rest
         public static float waterRemoveDepth = 15f;     // m below the surface a sunk canopy is removed
         public static float compressStiffness = 0.3f;
@@ -119,6 +120,7 @@ namespace ChuteFX
             n.TryGetValue("bendStiffness", ref bendStiffness);
             n.TryGetValue("tetherOnLanding", ref tetherOnLanding);
             n.TryGetValue("lineGray", ref lineGray);
+            n.TryGetValue("lineColorAuto", ref lineColorAuto);
             n.TryGetValue("settleMax", ref settleMax);
             n.TryGetValue("waterRemoveDepth", ref waterRemoveDepth);
             n.TryGetValue("minPieceSize", ref minPieceSize);
@@ -440,6 +442,7 @@ namespace ChuteFX
         public bool[] onGround;
         public int[][] ropes;
         public float ropeWidth;
+        public Color ropeColor = new Color(0.78f, 0.78f, 0.757f, 1f);   // colour of the original lines (or lineGray)
         public Mesh ropeMesh;
         public MeshRenderer ropeR;
         public Vector3[] ropeVerts, ropeNormals;
@@ -742,7 +745,7 @@ namespace ChuteFX
                 fadeShaderTried = true;
                 fadeShader = Shader.Find("KSP/Alpha/Translucent Specular");
                 if (fadeShader == null) fadeShader = Shader.Find("KSP/Alpha/Translucent");
-                Cfg.Log("Semi-transparent: shader=" + (fadeShader != null ? fadeShader.name : "keiner gefunden - aus"));
+                Cfg.Log("Semi-transparent: shader=" + (fadeShader != null ? fadeShader.name : "none found - off"));
             }
             if (fadeShader == null) return null;
             m = new Material(fadeShader);
@@ -1199,7 +1202,7 @@ namespace ChuteFX
         }
 
         static Dictionary<Material, Material> ropeMats = new Dictionary<Material, Material>();
-        // Stock lines are thin light-grey lines: the original's shader, but without the canopy texture
+        // Ropes: the original's shader, but without the canopy texture; the colour is set per canopy (property block)
         static Material RopeMaterial(Material src)
         {
             Material m;
@@ -1214,6 +1217,119 @@ namespace ChuteFX
             if (m.HasProperty("_SpecColor")) m.SetColor("_SpecColor", new Color(0.1f, 0.1f, 0.1f, 1f));
             ropeMats[src] = m;
             return m;
+        }
+
+        // ---------- Colour of the original lines ----------
+        // The ropes take the colour the original lines have in their texture: sampled inside the line triangles
+        // (UVs), weighted by their size and, on alpha/cutout materials, by the texture alpha (the stock Mk16 draws its
+        // lines on a mostly transparent cone). KSP textures are usually not readable, so the texture is copied once
+        // through a RenderTexture. The result is cached per part and texture.
+        internal class LineTri
+        {
+            public Material mat;
+            public Vector2 a, b, c;
+            public float w;
+            public LineTri(Material mat, Vector2 a, Vector2 b, Vector2 c, float w) { this.mat = mat; this.a = a; this.b = b; this.c = c; this.w = w; }
+        }
+
+        static Dictionary<string, Color> lineColorCache = new Dictionary<string, Color>();
+
+        // all triangles of a separate line mesh
+        static void AddLineTris(List<LineTri> list, Mesh m, Material[] mats, Vector3[] wv)
+        {
+            Vector2[] uv = m.uv;
+            if (uv == null || uv.Length != wv.Length || mats == null || mats.Length == 0) return;
+            for (int s = 0; s < m.subMeshCount; s++)
+            {
+                int[] tri = m.GetTriangles(s);
+                Material mat = mats[Mathf.Min(s, mats.Length - 1)];
+                for (int k = 0; k + 2 < tri.Length; k += 3)
+                {
+                    float area2 = Vector3.Cross(wv[tri[k + 1]] - wv[tri[k]], wv[tri[k + 2]] - wv[tri[k]]).magnitude;
+                    list.Add(new LineTri(mat, uv[tri[k]], uv[tri[k + 1]], uv[tri[k + 2]], area2));
+                }
+            }
+        }
+
+        static bool UsesAlpha(Material m)
+        {
+            if (m.HasProperty("_Cutoff")) return true;
+            string n = m.shader != null ? m.shader.name.ToLowerInvariant() : "";
+            return n.Contains("alpha") || n.Contains("cutoff") || n.Contains("transparent") || n.Contains("translucent");
+        }
+
+        // readable copy of a texture (at most 2048 px per side); the caller destroys it
+        static Texture2D ReadableCopy(Texture tex)
+        {
+            int w = Mathf.Min(tex.width, 2048), h = Mathf.Min(tex.height, 2048);
+            RenderTexture rt = RenderTexture.GetTemporary(w, h, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Default);
+            RenderTexture prev = RenderTexture.active;
+            Graphics.Blit(tex, rt);
+            RenderTexture.active = rt;
+            Texture2D copy = new Texture2D(w, h, TextureFormat.RGBA32, false);
+            copy.ReadPixels(new Rect(0, 0, w, h), 0, 0);
+            copy.Apply(false);
+            copy.wrapMode = TextureWrapMode.Repeat;
+            RenderTexture.active = prev;
+            RenderTexture.ReleaseTemporary(rt);
+            return copy;
+        }
+
+        static bool LineColor(List<LineTri> tris, string partName, out Color col)
+        {
+            col = Color.white;
+            if (tris.Count == 0) return false;
+            string key = partName;
+            foreach (LineTri t in tris)
+                if (t.mat != null && t.mat.HasProperty("_MainTex") && t.mat.mainTexture != null && !key.Contains("|" + t.mat.mainTexture.GetInstanceID()))
+                    key += "|" + t.mat.mainTexture.GetInstanceID();
+            if (lineColorCache.TryGetValue(key, out col)) return true;
+            Dictionary<Texture, Texture2D> copies = new Dictionary<Texture, Texture2D>();
+            double sr = 0, sg = 0, sb = 0, sw = 0;
+            try
+            {
+                foreach (LineTri t in tris)
+                {
+                    if (t.mat == null || t.w <= 0f) continue;
+                    Texture tex = t.mat.HasProperty("_MainTex") ? t.mat.mainTexture : null;
+                    Texture2D rd = null;
+                    if (tex != null && !copies.TryGetValue(tex, out rd)) { rd = ReadableCopy(tex); copies[tex] = rd; }
+                    Color tint = t.mat.HasProperty("_Color") ? t.mat.color : Color.white;
+                    Vector2 sc = t.mat.HasProperty("_MainTex") ? t.mat.mainTextureScale : Vector2.one;
+                    Vector2 of = t.mat.HasProperty("_MainTex") ? t.mat.mainTextureOffset : Vector2.zero;
+                    bool alpha = UsesAlpha(t.mat);
+                    // 10 points inside the triangle (barycentric grid)
+                    for (int i = 1; i <= 4; i++)
+                        for (int j = 1; i + j <= 5; j++)
+                        {
+                            int k = 6 - i - j;
+                            Vector2 uv = (t.a * i + t.b * j + t.c * k) / 6f;
+                            uv = new Vector2(uv.x * sc.x + of.x, uv.y * sc.y + of.y);
+                            Color p = rd != null ? rd.GetPixelBilinear(uv.x, uv.y) : Color.white;
+                            double w = t.w * (alpha ? p.a : 1f);
+                            sr += p.r * tint.r * w; sg += p.g * tint.g * w; sb += p.b * tint.b * w; sw += w;
+                        }
+                }
+            }
+            catch (Exception ex) { Cfg.Log("Line colour not readable: " + ex.Message); sw = 0; }
+            foreach (Texture2D cp in copies.Values) if (cp != null) Destroy(cp);
+            if (sw <= 1e-9) return false;
+            col = new Color((float)(sr / sw), (float)(sg / sw), (float)(sb / sw), 1f);
+            lineColorCache[key] = col;
+            return true;
+        }
+
+        // Long, pointed triangle (shortest edge < 0.2 x longest, longest > 0.12 x mesh size): returns the vertex opposite
+        // the shortest edge (the tip), otherwise -1
+        static int SpikeTip(List<Vector3> P, int a, int b, int c, float D)
+        {
+            float lab = (P[a] - P[b]).magnitude, lbc = (P[b] - P[c]).magnitude, lca = (P[c] - P[a]).magnitude;
+            float lmax = Mathf.Max(lab, Mathf.Max(lbc, lca));
+            float lmin = Mathf.Min(lab, Mathf.Min(lbc, lca));
+            if (lmax <= 0.12f * D || lmin >= 0.2f * lmax) return -1;
+            if (lab == lmin) return c;
+            if (lbc == lmin) return a;
+            return b;
         }
 
         static bool IsLineRenderer(Renderer r, Mesh m)
@@ -1269,6 +1385,8 @@ namespace ChuteFX
             List<List<List<int>>> pendingTris = new List<List<List<int>>>();
             Material[] lineMats = null;
             int lineLayer = 0;
+            List<LineTri> lineTriList = new List<LineTri>();   // line triangles with UVs, for the rope colour
+            List<Vector3> coneTips = new List<Vector3>();      // knots of line cones (stock Mk16: lines drawn on a cone)
             string names = "";
 
             List<Renderer> rlist = new List<Renderer>(src.GetComponentsInChildren<Renderer>(true));
@@ -1298,6 +1416,7 @@ namespace ChuteFX
                     for (int i = 0; i < wv.Length; i++) linePts.Add(inv * (wv[i] - pivotW));
                     lineMats = r.sharedMaterials;
                     lineLayer = r.gameObject.layer;
+                    AddLineTris(lineTriList, m, r.sharedMaterials, wv);
                     continue;
                 }
 
@@ -1350,6 +1469,24 @@ namespace ChuteFX
                 float D = (bmx - bmn).magnitude;
                 List<List<int>> triLists = new List<List<int>>();
                 pendingTris.Add(triLists);
+                // Line cones: the stock Mk16 draws its lines as a texture on a cone of long, pointed triangles from the hem
+                // to one knot (base/length ~0.12, too wide for the thin-triangle test). Count per knot how many long pointed
+                // triangles end there; 6 or more make a line cone.
+                Dictionary<int, int> spikeTips = new Dictionary<int, int>();
+                Vector2[] uvs = m.uv;
+                Material[] mats = r.sharedMaterials;
+                for (int s = 0; s < m.subMeshCount; s++)
+                {
+                    int[] tri = m.GetTriangles(s);
+                    for (int k = 0; k + 2 < tri.Length; k += 3)
+                    {
+                        int tip = SpikeTip(P, map[tri[k]], map[tri[k + 1]], map[tri[k + 2]], D);
+                        if (tip < 0) continue;
+                        int cnt;
+                        spikeTips.TryGetValue(tip, out cnt);
+                        spikeTips[tip] = cnt + 1;
+                    }
+                }
                 for (int s = 0; s < m.subMeshCount; s++)
                 {
                     int[] tri = m.GetTriangles(s);
@@ -1361,8 +1498,16 @@ namespace ChuteFX
                         float lab = (P[a] - P[tb]).magnitude, lbc = (P[tb] - P[cc]).magnitude, lca = (P[cc] - P[a]).magnitude;
                         float lmax = Mathf.Max(lab, Mathf.Max(lbc, lca));
                         float area2 = Vector3.Cross(P[tb] - P[a], P[cc] - P[a]).magnitude;
-                        if (lmax > 0.12f * D && area2 / Mathf.Max(lmax, 1e-6f) < 0.12f * lmax)
+                        int tipOf = SpikeTip(P, a, tb, cc, D);
+                        int tipCount = 0;
+                        if (tipOf >= 0) spikeTips.TryGetValue(tipOf, out tipCount);
+                        bool thinLine = lmax > 0.12f * D && area2 / Mathf.Max(lmax, 1e-6f) < 0.12f * lmax;
+                        if (thinLine || tipCount >= 6)
                         {
+                            if (!thinLine && !coneTips.Contains(P[tipOf])) coneTips.Add(P[tipOf]);
+                            if (uvs.Length == wv.Length)
+                                lineTriList.Add(new LineTri(mats.Length > 0 ? mats[Mathf.Min(s, mats.Length - 1)] : null,
+                                                            uvs[tri[k]], uvs[tri[k + 1]], uvs[tri[k + 2]], area2));
                             meshLinePts.Add(P[a]); meshLinePts.Add(P[tb]); meshLinePts.Add(P[cc]);
                             meshLineMesh.Add(f.parts.Count); meshLineMesh.Add(f.parts.Count); meshLineMesh.Add(f.parts.Count);
                             lineTris++;
@@ -1470,6 +1615,20 @@ namespace ChuteFX
                     foreach (Vector3 lp in meshLinePts) { float dd = (lp - cenC).sqrMagnitude; if (dd > fd) { fd = dd; conf = lp; } }
                 }
             }
+            if (coneTips.Count > 0)
+            {
+                // Line cone (stock Mk16): the lines meet at the cone tip above the part and a single riser runs from there
+                // down to the part (the farthest line point, unless separate line meshes give the riser end)
+                Vector3 kn = Vector3.zero;
+                foreach (Vector3 q in coneTips) kn += q;
+                kn /= coneTips.Count;
+                if (linePts.Count == 0)
+                {
+                    float fd = (kn - cenC).sqrMagnitude;
+                    foreach (Vector3 lp in meshLinePts) { float dd = (lp - cenC).sqrMagnitude; if (dd > fd) { fd = dd; riserEnd = lp; } }
+                }
+                conf = kn;
+            }
             if ((cenC - conf).sqrMagnitude < 0.01f) conf = Vector3.zero;
             Vector3 axis = (cenC - conf).sqrMagnitude > 1e-6f ? (cenC - conf).normalized : Vector3.up;
             int confluence = P.Count;
@@ -1488,22 +1647,47 @@ namespace ChuteFX
                 List<Vector3> wl = new List<Vector3>();
                 if (groups > 1) for (int k = 0; k < meshLinePts.Count; k++) if (meshLineMesh[k] == gMesh[g]) wl.Add(meshLinePts[k]);
                 if (wl.Count < 4) wl = meshLinePts.Count > 0 ? meshLinePts : linePts;
-                int ropeCount = Mathf.Clamp(CountWireClusters(wl, conf, ax, u, w), 6, groups > 1 ? 16 : 32);
-                int[] attach = new int[ropeCount];
-                float[] best = new float[ropeCount];
-                for (int k = 0; k < ropeCount; k++) { attach[k] = -1; best[k] = -1e9f; }
-                foreach (int i in gPts[g])
+                int[] attach;
+                List<Vector3> tops = WireTops(wl, conf, ax, u, w);
+                if (tops.Count >= 6 && tops.Count <= (groups > 1 ? 16 : 32))
                 {
-                    Vector3 p = P[i] - conf;
-                    float hh = Vector3.Dot(p, ax);
-                    Vector3 rad = p - ax * hh;
-                    float ang = Mathf.Atan2(Vector3.Dot(rad, w), Vector3.Dot(rad, u));
-                    int sec = Mathf.Clamp(Mathf.FloorToInt((ang + Mathf.PI) / (2f * Mathf.PI) * ropeCount), 0, ropeCount - 1);
-                    // hem = large radius, as close to the cut point as possible
-                    float score = rad.magnitude - 0.35f * hh;
-                    if (score > best[sec]) { best[sec] = score; attach[sec] = i; }
+                    // where the original lines end: each rope starts at the cloth point nearest to the top of a line, so
+                    // the cut copy continues the original lines without a jump
+                    attach = new int[tops.Count];
+                    HashSet<int> taken = new HashSet<int>();
+                    for (int k = 0; k < tops.Count; k++)
+                    {
+                        attach[k] = -1;
+                        float bd = float.MaxValue;
+                        foreach (int i in gPts[g])
+                        {
+                            if (taken.Contains(i)) continue;
+                            float dd = (P[i] - tops[k]).sqrMagnitude;
+                            if (dd < bd) { bd = dd; attach[k] = i; }
+                        }
+                        if (attach[k] >= 0) taken.Add(attach[k]);
+                    }
                 }
-                for (int k = 0; k < ropeCount; k++)
+                else
+                {
+                    // no usable line ends: evenly around the hem, one rope per sector
+                    int ropeCount = Mathf.Clamp(CountWireClusters(wl, conf, ax, u, w), 6, groups > 1 ? 16 : 32);
+                    attach = new int[ropeCount];
+                    float[] best = new float[ropeCount];
+                    for (int k = 0; k < ropeCount; k++) { attach[k] = -1; best[k] = -1e9f; }
+                    foreach (int i in gPts[g])
+                    {
+                        Vector3 p = P[i] - conf;
+                        float hh = Vector3.Dot(p, ax);
+                        Vector3 rad = p - ax * hh;
+                        float ang = Mathf.Atan2(Vector3.Dot(rad, w), Vector3.Dot(rad, u));
+                        int sec = Mathf.Clamp(Mathf.FloorToInt((ang + Mathf.PI) / (2f * Mathf.PI) * ropeCount), 0, ropeCount - 1);
+                        // hem = large radius, as close to the cut point as possible
+                        float score = rad.magnitude - 0.35f * hh;
+                        if (score > best[sec]) { best[sec] = score; attach[sec] = i; }
+                    }
+                }
+                for (int k = 0; k < attach.Length; k++)
                 {
                     if (attach[k] < 0) continue;
                     Vector3 top = P[attach[k]];
@@ -1536,6 +1720,8 @@ namespace ChuteFX
             }
             f.ropes = ropes.ToArray();
             f.ropeWidth = Cfg.lineWidth > 0f ? Cfg.lineWidth : Mathf.Clamp((cenC - conf).magnitude * 0.0015f, 0.006f, 0.02f);
+            // lines that are only drawn in the texture (stock Mk16 cone) look thinner and slightly broken: thinner ropes
+            if (Cfg.lineWidth <= 0f && coneTips.Count > 0) f.ropeWidth *= 0.6f;
             if (ropes.Count > 0)
             {
                 GameObject rgo = new GameObject("ChuteFX_Ropes");
@@ -1548,6 +1734,15 @@ namespace ChuteFX
                 rr.sharedMaterial = RopeMaterial((lineMats != null && lineMats.Length > 0) ? lineMats[0] : f.parts[0].r.sharedMaterial);
                 rr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
                 f.ropeR = rr;
+                Color lc = Color.white;
+                bool sampled = Cfg.lineColorAuto && LineColor(lineTriList, c.mod.part.partInfo.name, out lc);
+                f.ropeColor = sampled ? lc : new Color(Cfg.lineGray, Cfg.lineGray, Cfg.lineGray * 0.97f, 1f);
+                if (f.mpb == null) f.mpb = new MaterialPropertyBlock();
+                rr.GetPropertyBlock(f.mpb);
+                f.mpb.SetColor("_Color", f.ropeColor);
+                rr.SetPropertyBlock(f.mpb);
+                Cfg.Log("Line colour: " + (sampled ? "from " + lineTriList.Count + " line triangles " : "lineGray ") + "(" + f.ropeColor.r.ToString("F2") + ", " +
+                        f.ropeColor.g.ToString("F2") + ", " + f.ropeColor.b.ToString("F2") + ")");
                 BuildRopeTopology(f);
             }
 
@@ -1637,10 +1832,29 @@ namespace ChuteFX
             f.groundY = -1e6f; f.nextGround = 0f;
             c.hidden.Clear();
             foreach (Renderer r in rlist) if (r.enabled) { c.hidden.Add(r); r.enabled = false; }
+            if (Cfg.debugLog)
+            {
+                // renderers of the part that stay visible after the cut (finds line meshes we did not recognise)
+                string vis = "";
+                foreach (Renderer r in c.mod.part.GetComponentsInChildren<Renderer>(false))
+                {
+                    if (!r.enabled || c.hidden.Contains(r)) continue;
+                    Mesh vm = null;
+                    SkinnedMeshRenderer vs = r as SkinnedMeshRenderer;
+                    if (vs != null) vm = vs.sharedMesh; else { MeshFilter vf = r.GetComponent<MeshFilter>(); if (vf != null) vm = vf.sharedMesh; }
+                    string path = r.name;
+                    for (Transform t = r.transform.parent; t != null && t != c.mod.part.transform; t = t.parent) path = t.name + "/" + path;
+                    vis += path + "(" + (vm != null ? vm.name + " v=" + vm.vertexCount : "-") + ") ";
+                }
+                Cfg.Log("Still visible on " + c.mod.part.partInfo.name + " after the cut: " + (vis.Length > 0 ? vis.Trim() : "nothing"));
+            }
             fallen.Add(f);
             Cfg.Log("Canopy cut: " + c.mod.part.partInfo.name + " alt=" + f.alt.ToString("F1") + " v=" + vLocal.magnitude.ToString("F1") +
                     " landed=" + v.LandedOrSplashed + " clothParticles=" + nCloth + " seams=" + stitches + " layerSeams=" + layerStitches + " removedPieces=" + dropped + " ropes=" + ropes.Count + " lineTris=" + lineTris + " seamDuplicates=" + bindMerged + " bendEdges=" + bends.Count +
                     " edges=" + edges.Count + " layerNeighbours=" + layerEx.ToString("F2") + "m boundaryPoints=" + CountTrue(f.smFix) + " parts=[" + names.Trim() + "]");
+            Cfg.Log("Lines: " + (coneTips.Count > 0 ? "cone (lines drawn in the texture), knot at the cone tip" : "knot at the line ends") +
+                    ", " + (ropes.Count - ((riserEnd - conf).magnitude > 0.2f ? 1 : 0)) + " ropes, riser " + (riserEnd - conf).magnitude.ToString("F1") +
+                    " m, rope width " + (f.ropeWidth * 100f).ToString("F1") + " cm");
         }
 
         static void AddEdge(Dictionary<long, float> edges, int a, int b, List<Vector3> P)
@@ -1934,6 +2148,54 @@ namespace ChuteFX
             return clusters;
         }
 
+        // Ends of the original lines at the hem: line points in the outer half (radius about the axis), grouped into
+        // clusters of neighbouring angle bins; returns the mean position of each cluster
+        static List<Vector3> WireTops(List<Vector3> pts, Vector3 conf, Vector3 axis, Vector3 u, Vector3 w)
+        {
+            List<Vector3> tops = new List<Vector3>();
+            if (pts.Count < 4) return tops;
+            float rMax = 0f;
+            foreach (Vector3 p0 in pts) { Vector3 p = p0 - conf; float hh = Vector3.Dot(p, axis); float r = (p - axis * hh).magnitude; if (r > rMax) rMax = r; }
+            const int bins = 120;
+            int[] binOf = new int[pts.Count];
+            bool[] occ = new bool[bins];
+            for (int i = 0; i < pts.Count; i++)
+            {
+                Vector3 p = pts[i] - conf;
+                float hh = Vector3.Dot(p, axis);
+                Vector3 rad = p - axis * hh;
+                binOf[i] = -1;
+                if (rad.magnitude < rMax * 0.5f) continue;
+                float ang = Mathf.Atan2(Vector3.Dot(rad, w), Vector3.Dot(rad, u));
+                binOf[i] = Mathf.Clamp(Mathf.FloorToInt((ang + Mathf.PI) / (2f * Mathf.PI) * bins), 0, bins - 1);
+                occ[binOf[i]] = true;
+            }
+            int start = -1;
+            for (int i = 0; i < bins; i++) if (occ[i] && !occ[(i + bins - 1) % bins]) { start = i; break; }
+            if (start < 0) return tops;
+            int[] cid = new int[bins];
+            int nc = 0;
+            for (int k = 0; k < bins; k++)
+            {
+                int i = (start + k) % bins;
+                cid[i] = -1;
+                if (!occ[i]) continue;
+                if (!occ[(i + bins - 1) % bins]) nc++;
+                cid[i] = nc - 1;
+            }
+            Vector3[] sum = new Vector3[nc];
+            int[] cnt = new int[nc];
+            for (int i = 0; i < pts.Count; i++)
+            {
+                if (binOf[i] < 0) continue;
+                int c = cid[binOf[i]];
+                sum[c] += pts[i];
+                cnt[c]++;
+            }
+            for (int c = 0; c < nc; c++) if (cnt[c] > 0) tops.Add(sum[c] / cnt[c]);
+            return tops;
+        }
+
         static void BuildRopeTopology(Fallen f)
         {
             int nodes = 0;
@@ -2161,7 +2423,7 @@ namespace ChuteFX
                 if (f.ropeR != null)
                 {
                     f.ropeR.GetPropertyBlock(f.mpb);
-                    f.mpb.SetColor("_Color", new Color(Cfg.lineGray * br, Cfg.lineGray * br, Cfg.lineGray * br * 0.97f, 1f));
+                    f.mpb.SetColor("_Color", new Color(f.ropeColor.r * br, f.ropeColor.g * br, f.ropeColor.b * br, 1f));
                     f.ropeR.SetPropertyBlock(f.mpb);
                 }
                 if (cen.y < -f.alt - Cfg.waterRemoveDepth) return false;

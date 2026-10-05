@@ -71,6 +71,7 @@ ones you are most likely to change:
 | `maxDistance` | `5000` | Canopies farther than this (m) from the active vessel are removed. |
 | `fadeOnHover`, `fadeForKerbals`, `fadeAlpha` | `true`, `true`, `0.55` | Transparency under the cursor and in front of Kerbals. |
 | `windSpeed` | `3` | Wind for cut canopies (m/s). |
+| `lineColorAuto` | `true` | The ropes take the colour of the original lines. `false` uses the grey `lineGray`. |
 | `layerThickness` | `0.05` | Distance between cloth layers on the ground. `0` turns layering off. |
 | `clusterSpread` | `false` | Open canopies of one vessel tilt apart instead of passing through each other. Off by default, because the cluster keeps rearranging when SAS corrects or the capsule rolls. |
 | `debugLog` | `true` | Messages tagged `[ChuteFX]` in `KSP.log`. |
