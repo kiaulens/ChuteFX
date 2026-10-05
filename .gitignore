@@ -1,0 +1,12 @@
+# build output (published as release downloads, not in the repository)
+GameData/ChuteFX/Plugins/*.dll
+*.zip
+# test output
+Tests/output/
+*.log
+# editor/OS files
+.vs/
+*.user
+Thumbs.db
+desktop.ini
+__pycache__/
