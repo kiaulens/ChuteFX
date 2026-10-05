@@ -38,6 +38,7 @@ if ($Deploy) {
     $dest = Join-Path $KspPath 'GameData\ChuteFX'
     New-Item -ItemType Directory -Force -Path $dest | Out-Null
     Copy-Item -Recurse -Force (Join-Path $root 'GameData\ChuteFX\*') $dest
+    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $dest 'Plugins\.gitkeep')
     Write-Host "Deployed to $dest"
 }
 
