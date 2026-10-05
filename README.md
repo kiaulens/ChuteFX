@@ -10,6 +10,23 @@ cloth that drifts down, drapes over the ground or floats on the water, and soaks
 
 ChuteFX is purely visual. It does not touch the physics or the drag of the parachutes.
 
+## Installation
+
+1. Install [ModuleManager](https://github.com/sarbian/ModuleManager). It adds the right-click entries.
+2. Download `ChuteFX-x.y.z.zip` from the [releases](https://github.com/kiaulens/ChuteFX/releases).
+3. Copy the `GameData/ChuteFX` folder into the `GameData` folder of your KSP installation.
+
+## Compatibility
+
+- KSP 1.12.x. Made and tested on 1.12.5.
+- Works with the stock parachutes (`ModuleParachute`) and with the ReStock parachute models. Other part packs that
+  use `ModuleParachute` should work as long as their canopy is a regular or skinned mesh.
+- RealChute is not supported: it does not use `ModuleParachute`.
+- [Parallax Continued](https://github.com/Gameslinx/Parallax-Continued): ChuteFX reads the Parallax terrain
+  displacement and lifts the cloth on land by that amount, so it doesn't sink into the tessellated ground. Grass and
+  other Parallax scatters still poke through the cloth.
+- Mods that only change the look of the world (Scatterer, EVE, TUFX, Deferred, ...) are fine.
+
 ## Features
 
 **Open canopy**
@@ -20,8 +37,9 @@ ChuteFX is purely visual. It does not touch the physics or the drag of the parac
 **Cut canopy**
 - A copy of the canopy is simulated as cloth (position-based dynamics, fixed 40 Hz step). Stretch is hard,
   compression and bending are soft in the air and stiffer on the ground, so the cloth lies in large folds.
-- Shroud lines become rope chains that run from the hem to the real line knot, with a riser to the part. After a
-  landed cut the riser stays attached to the part.
+- Shroud lines become rope chains that start where the original lines end at the hem and run to the real line knot,
+  with a riser to the part. After a landed cut the riser stays attached to the part. The ropes take their colour from
+  the original line texture, including a dark edge if the original lines have one (stock Mk16).
 - Air: sail force normal to the cloth, a short residual pressure that keeps the canopy inflated for a moment after
   the cut, turbulence, and a shared wind per celestial body that slowly changes strength and direction with game
   time, so all canopies blow the same way.
@@ -40,23 +58,6 @@ ChuteFX is purely visual. It does not touch the physics or the drag of the parac
   while a cut canopy is lying around. Repacking the parachute on EVA removes its canopy as well.
 - Menu texts are translated into English, German, Spanish, French, Italian, Brazilian Portuguese, Russian, Japanese
   and Simplified Chinese.
-
-## Compatibility
-
-- KSP 1.12.x. Made and tested on 1.12.5.
-- Works with the stock parachutes (`ModuleParachute`) and with the ReStock parachute models. Other part packs that
-  use `ModuleParachute` should work as long as their canopy is a regular or skinned mesh.
-- RealChute is not supported: it does not use `ModuleParachute`.
-- [Parallax Continued](https://github.com/Gameslinx/Parallax-Continued): ChuteFX reads the Parallax terrain
-  displacement and lifts the cloth on land by that amount, so it doesn't sink into the tessellated ground. Grass and
-  other Parallax scatters still poke through the cloth.
-- Mods that only change the look of the world (Scatterer, EVE, TUFX, Deferred, ...) are fine.
-
-## Installation
-
-1. Install [ModuleManager](https://github.com/sarbian/ModuleManager). It adds the right-click entries.
-2. Download `ChuteFX-x.y.z.zip` from the [releases](https://github.com/kiaulens/ChuteFX/releases).
-3. Copy the `GameData/ChuteFX` folder into the `GameData` folder of your KSP installation.
 
 ## Settings
 

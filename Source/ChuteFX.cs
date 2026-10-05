@@ -443,6 +443,7 @@ namespace ChuteFX
         public int[][] ropes;
         public float ropeWidth;
         public Color ropeColor = new Color(0.78f, 0.78f, 0.757f, 1f);   // colour of the original lines (or lineGray)
+        public Texture2D ropeTex;           // rope texture across the width (main colour + dark stroke), null = _Color only
         public Mesh ropeMesh;
         public MeshRenderer ropeR;
         public Vector3[] ropeVerts, ropeNormals;
@@ -1232,8 +1233,6 @@ namespace ChuteFX
             public LineTri(Material mat, Vector2 a, Vector2 b, Vector2 c, float w) { this.mat = mat; this.a = a; this.b = b; this.c = c; this.w = w; }
         }
 
-        static Dictionary<string, Color> lineColorCache = new Dictionary<string, Color>();
-
         // all triangles of a separate line mesh
         static void AddLineTris(List<LineTri> list, Mesh m, Material[] mats, Vector3[] wv)
         {
@@ -1275,48 +1274,182 @@ namespace ChuteFX
             return copy;
         }
 
-        static bool LineColor(List<LineTri> tris, string partName, out Color col)
+        // Look of the original lines: main colour and, if the line texture has a clearly darker part (the stock Mk16
+        // paints each line as one gold and one dark texel row), that dark colour and its share of the line width.
+        internal struct RopeLook
         {
-            col = Color.white;
+            public Color main, shadow;
+            public float share;      // share of the dark stroke, 0 = one colour
+        }
+
+        static Dictionary<string, RopeLook> lineLookCache = new Dictionary<string, RopeLook>();
+        static Dictionary<string, Texture2D> ropeTexCache = new Dictionary<string, Texture2D>();
+
+        // Every texel inside the UV footprint of the line triangles (exact, no filtering: a 2-texel line next to
+        // transparent texels must not pick up their colour), on alpha/cutout materials only the opaque ones; weighted
+        // by triangle size. Then split into a light and a dark group by brightness.
+        static bool LineLook(List<LineTri> tris, string partName, out RopeLook look)
+        {
+            look = new RopeLook();
             if (tris.Count == 0) return false;
             string key = partName;
             foreach (LineTri t in tris)
                 if (t.mat != null && t.mat.HasProperty("_MainTex") && t.mat.mainTexture != null && !key.Contains("|" + t.mat.mainTexture.GetInstanceID()))
                     key += "|" + t.mat.mainTexture.GetInstanceID();
-            if (lineColorCache.TryGetValue(key, out col)) return true;
-            Dictionary<Texture, Texture2D> copies = new Dictionary<Texture, Texture2D>();
-            double sr = 0, sg = 0, sb = 0, sw = 0;
+            if (lineLookCache.TryGetValue(key, out look)) return true;
+            const int NB = 64;
+            double[] hw = new double[NB], hr = new double[NB], hg = new double[NB], hb = new double[NB];
+            Dictionary<Texture, Color32[]> pixels = new Dictionary<Texture, Color32[]>();
+            Dictionary<Texture, Vector2Int> sizes = new Dictionary<Texture, Vector2Int>();
+            List<Color32> texels = new List<Color32>();
+            // per UV footprint (material + triangle in texels): its normalised histogram, null = no opaque texel.
+            // Many line triangles share one footprint (all 36 cone triangles of the stock Mk16): rasterised only once.
+            Dictionary<string, double[]> foot = new Dictionary<string, double[]>();
             try
             {
                 foreach (LineTri t in tris)
                 {
                     if (t.mat == null || t.w <= 0f) continue;
-                    Texture tex = t.mat.HasProperty("_MainTex") ? t.mat.mainTexture : null;
-                    Texture2D rd = null;
-                    if (tex != null && !copies.TryGetValue(tex, out rd)) { rd = ReadableCopy(tex); copies[tex] = rd; }
                     Color tint = t.mat.HasProperty("_Color") ? t.mat.color : Color.white;
-                    Vector2 sc = t.mat.HasProperty("_MainTex") ? t.mat.mainTextureScale : Vector2.one;
-                    Vector2 of = t.mat.HasProperty("_MainTex") ? t.mat.mainTextureOffset : Vector2.zero;
+                    Texture tex = t.mat.HasProperty("_MainTex") ? t.mat.mainTexture : null;
+                    if (tex == null) { AddTexel(hw, hr, hg, hb, tint, t.w); continue; }
+                    Color32[] px;
+                    if (!pixels.TryGetValue(tex, out px))
+                    {
+                        Texture2D cp = ReadableCopy(tex);
+                        px = cp.GetPixels32();
+                        sizes[tex] = new Vector2Int(cp.width, cp.height);
+                        pixels[tex] = px;
+                        Destroy(cp);
+                    }
+                    int W = sizes[tex].x, H = sizes[tex].y;
+                    Vector2 sc = t.mat.mainTextureScale, of = t.mat.mainTextureOffset;
+                    Vector2 a = new Vector2((t.a.x * sc.x + of.x) * W, (t.a.y * sc.y + of.y) * H);
+                    Vector2 b = new Vector2((t.b.x * sc.x + of.x) * W, (t.b.y * sc.y + of.y) * H);
+                    Vector2 c = new Vector2((t.c.x * sc.x + of.x) * W, (t.c.y * sc.y + of.y) * H);
+                    string fk = FootKey(t.mat, a, b, c);
+                    double[] fh;
+                    if (foot.TryGetValue(fk, out fh))
+                    {
+                        if (fh != null) for (int i = 0; i < NB; i++) { hw[i] += fh[i] * t.w; hr[i] += fh[NB + i] * t.w; hg[i] += fh[2 * NB + i] * t.w; hb[i] += fh[3 * NB + i] * t.w; }
+                        continue;
+                    }
+                    texels.Clear();
+                    float minX = Mathf.Min(a.x, Mathf.Min(b.x, c.x)), maxX = Mathf.Max(a.x, Mathf.Max(b.x, c.x));
+                    float minY = Mathf.Min(a.y, Mathf.Min(b.y, c.y)), maxY = Mathf.Max(a.y, Mathf.Max(b.y, c.y));
+                    float box = (maxX - minX + 1f) * (maxY - minY + 1f);
+                    int step = box > 60000f ? Mathf.CeilToInt(Mathf.Sqrt(box / 60000f)) : 1;
+                    float d = Cross2(b - a, c - a);
+                    if (Mathf.Abs(d) > 1e-6f)
+                        for (int y = Mathf.FloorToInt(minY); y <= Mathf.CeilToInt(maxY); y += step)
+                            for (int x = Mathf.FloorToInt(minX); x <= Mathf.CeilToInt(maxX); x += step)
+                            {
+                                Vector2 q = new Vector2(x + 0.5f, y + 0.5f);
+                                float w0 = Cross2(b - q, c - q) / d, w1 = Cross2(c - q, a - q) / d;
+                                if (w0 < 0f || w1 < 0f || w0 + w1 > 1f) continue;
+                                texels.Add(px[Mod(y, H) * W + Mod(x, W)]);
+                            }
+                    if (texels.Count == 0)
+                        // footprint thinner than one texel: the texels under ten points of the triangle
+                        for (int i = 1; i <= 4; i++)
+                            for (int j = 1; i + j <= 5; j++)
+                            {
+                                Vector2 q = (a * i + b * j + c * (6 - i - j)) / 6f;
+                                texels.Add(px[Mod(Mathf.FloorToInt(q.y), H) * W + Mod(Mathf.FloorToInt(q.x), W)]);
+                            }
                     bool alpha = UsesAlpha(t.mat);
-                    // 10 points inside the triangle (barycentric grid)
-                    for (int i = 1; i <= 4; i++)
-                        for (int j = 1; i + j <= 5; j++)
-                        {
-                            int k = 6 - i - j;
-                            Vector2 uv = (t.a * i + t.b * j + t.c * k) / 6f;
-                            uv = new Vector2(uv.x * sc.x + of.x, uv.y * sc.y + of.y);
-                            Color p = rd != null ? rd.GetPixelBilinear(uv.x, uv.y) : Color.white;
-                            double w = t.w * (alpha ? p.a : 1f);
-                            sr += p.r * tint.r * w; sg += p.g * tint.g * w; sb += p.b * tint.b * w; sw += w;
-                        }
+                    int n = 0;
+                    foreach (Color32 q in texels) if (!alpha || q.a >= 128) n++;
+                    if (n == 0) { foot[fk] = null; continue; }
+                    fh = new double[4 * NB];
+                    double[] fw = new double[NB], fr = new double[NB], fg = new double[NB], fb = new double[NB];
+                    foreach (Color32 q in texels)
+                        if (!alpha || q.a >= 128)
+                            AddTexel(fw, fr, fg, fb, new Color(q.r / 255f * tint.r, q.g / 255f * tint.g, q.b / 255f * tint.b, 1f), 1f / n);
+                    for (int i = 0; i < NB; i++) { fh[i] = fw[i]; fh[NB + i] = fr[i]; fh[2 * NB + i] = fg[i]; fh[3 * NB + i] = fb[i]; }
+                    foot[fk] = fh;
+                    for (int i = 0; i < NB; i++) { hw[i] += fh[i] * t.w; hr[i] += fh[NB + i] * t.w; hg[i] += fh[2 * NB + i] * t.w; hb[i] += fh[3 * NB + i] * t.w; }
                 }
             }
-            catch (Exception ex) { Cfg.Log("Line colour not readable: " + ex.Message); sw = 0; }
-            foreach (Texture2D cp in copies.Values) if (cp != null) Destroy(cp);
-            if (sw <= 1e-9) return false;
-            col = new Color((float)(sr / sw), (float)(sg / sw), (float)(sb / sw), 1f);
-            lineColorCache[key] = col;
+            catch (Exception ex) { Cfg.Log("Line colour not readable: " + ex.Message); Array.Clear(hw, 0, NB); }
+            double tot = 0, lumSum = 0, tr = 0, tg = 0, tb = 0;
+            for (int i = 0; i < NB; i++) { tot += hw[i]; lumSum += hw[i] * (i + 0.5) / NB; tr += hr[i]; tg += hg[i]; tb += hb[i]; }
+            if (tot <= 1e-12) return false;
+            look.main = new Color((float)(tr / tot), (float)(tg / tot), (float)(tb / tot), 1f);
+            // two groups by brightness (k-means on the histogram)
+            double thr = lumSum / tot, wL = 0, wD = 0, mL = 0, mD = 0;
+            for (int it = 0; it < 10; it++)
+            {
+                wL = wD = mL = mD = 0;
+                for (int i = 0; i < NB; i++)
+                {
+                    double l = (i + 0.5) / NB;
+                    if (l >= thr) { wL += hw[i]; mL += hw[i] * l; } else { wD += hw[i]; mD += hw[i] * l; }
+                }
+                if (wL <= 0 || wD <= 0) break;
+                mL /= wL; mD /= wD;
+                thr = (mL + mD) * 0.5;
+            }
+            double share = wD / tot;
+            if (wL > 0 && wD > 0 && share >= 0.15 && share <= 0.7 && mD < 0.5 * mL)
+            {
+                double lr = 0, lg = 0, lb = 0, dr = 0, dg = 0, db = 0;
+                for (int i = 0; i < NB; i++)
+                {
+                    if ((i + 0.5) / NB >= thr) { lr += hr[i]; lg += hg[i]; lb += hb[i]; }
+                    else { dr += hr[i]; dg += hg[i]; db += hb[i]; }
+                }
+                look.main = new Color((float)(lr / wL), (float)(lg / wL), (float)(lb / wL), 1f);
+                look.shadow = new Color((float)(dr / wD), (float)(dg / wD), (float)(db / wD), 1f);
+                look.share = (float)share;
+            }
+            lineLookCache[key] = look;
             return true;
+        }
+
+        static void AddTexel(double[] hw, double[] hr, double[] hg, double[] hb, Color p, float w)
+        {
+            float lum = 0.299f * p.r + 0.587f * p.g + 0.114f * p.b;
+            int bi = Mathf.Clamp((int)(lum * hw.Length), 0, hw.Length - 1);
+            hw[bi] += w; hr[bi] += p.r * w; hg[bi] += p.g * w; hb[bi] += p.b * w;
+        }
+
+        static int Mod(int x, int m) { int r = x % m; return r < 0 ? r + m : r; }
+
+        // key of a UV footprint: material and the three corners in quarter texels, in a fixed order
+        static string FootKey(Material m, Vector2 a, Vector2 b, Vector2 c)
+        {
+            long ka = ((long)Mathf.RoundToInt(a.x * 4f) << 32) ^ (uint)Mathf.RoundToInt(a.y * 4f);
+            long kb = ((long)Mathf.RoundToInt(b.x * 4f) << 32) ^ (uint)Mathf.RoundToInt(b.y * 4f);
+            long kc = ((long)Mathf.RoundToInt(c.x * 4f) << 32) ^ (uint)Mathf.RoundToInt(c.y * 4f);
+            long t;
+            if (ka > kb) { t = ka; ka = kb; kb = t; }
+            if (kb > kc) { t = kb; kb = kc; kc = t; }
+            if (ka > kb) { t = ka; ka = kb; kb = t; }
+            return m.GetInstanceID() + ":" + ka + ":" + kb + ":" + kc;
+        }
+        static float Cross2(Vector2 a, Vector2 b) { return a.x * b.y - a.y * b.x; }
+
+        // Rope texture across its width (u): the main colour and, if the original lines have one, a dark stroke on
+        // one side. The original stroke is a single texel row that shows as a thin edge at a distance; with the same
+        // share the ropes looked mostly dark in game, so it takes half the original share (1 to 3 of 8 texels).
+        // k = brightness factor.
+        static Texture2D RopeTexture(RopeLook look, float k)
+        {
+            int dark = look.share > 0f ? Mathf.Clamp(Mathf.RoundToInt(look.share * 0.5f * 8f), 1, 3) : 0;
+            Color m = new Color(look.main.r * k, look.main.g * k, look.main.b * k, 1f);
+            Color sh = new Color(look.shadow.r * k, look.shadow.g * k, look.shadow.b * k, 1f);
+            string key = m.ToString("F3") + "|" + sh.ToString("F3") + "|" + dark;
+            Texture2D tex;
+            if (ropeTexCache.TryGetValue(key, out tex) && tex != null) return tex;
+            tex = new Texture2D(8, 1, TextureFormat.RGBA32, false);
+            tex.name = "ChuteFX_RopeTex";
+            tex.wrapMode = TextureWrapMode.Clamp;
+            tex.filterMode = FilterMode.Point;
+            for (int i = 0; i < 8; i++) tex.SetPixel(i, 0, i < 8 - dark ? m : sh);
+            tex.Apply(false);
+            ropeTexCache[key] = tex;
+            return tex;
         }
 
         // Long, pointed triangle (shortest edge < 0.2 x longest, longest > 0.12 x mesh size): returns the vertex opposite
@@ -1720,8 +1853,6 @@ namespace ChuteFX
             }
             f.ropes = ropes.ToArray();
             f.ropeWidth = Cfg.lineWidth > 0f ? Cfg.lineWidth : Mathf.Clamp((cenC - conf).magnitude * 0.0015f, 0.006f, 0.02f);
-            // lines that are only drawn in the texture (stock Mk16 cone) look thinner and slightly broken: thinner ropes
-            if (Cfg.lineWidth <= 0f && coneTips.Count > 0) f.ropeWidth *= 0.6f;
             if (ropes.Count > 0)
             {
                 GameObject rgo = new GameObject("ChuteFX_Ropes");
@@ -1734,15 +1865,27 @@ namespace ChuteFX
                 rr.sharedMaterial = RopeMaterial((lineMats != null && lineMats.Length > 0) ? lineMats[0] : f.parts[0].r.sharedMaterial);
                 rr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
                 f.ropeR = rr;
-                Color lc = Color.white;
-                bool sampled = Cfg.lineColorAuto && LineColor(lineTriList, c.mod.part.partInfo.name, out lc);
-                f.ropeColor = sampled ? lc : new Color(Cfg.lineGray, Cfg.lineGray, Cfg.lineGray * 0.97f, 1f);
+                RopeLook look = new RopeLook();
+                bool sampled = Cfg.lineColorAuto && LineLook(lineTriList, c.mod.part.partInfo.name, out look);
+                if (!sampled) look = new RopeLook { main = new Color(Cfg.lineGray, Cfg.lineGray, Cfg.lineGray * 0.97f, 1f) };
+                // lines painted on a cone (stock Mk16) get less light than the ropes: the cone faces down and sideways,
+                // the ropes upward. In game the ropes looked clearly brighter.
+                float lk = sampled && coneTips.Count > 0 ? 0.87f : 1f;
+                f.ropeColor = new Color(look.main.r * lk, look.main.g * lk, look.main.b * lk, 1f);
                 if (f.mpb == null) f.mpb = new MaterialPropertyBlock();
                 rr.GetPropertyBlock(f.mpb);
-                f.mpb.SetColor("_Color", f.ropeColor);
+                if (rr.sharedMaterial != null && rr.sharedMaterial.HasProperty("_MainTex"))
+                {
+                    f.ropeTex = RopeTexture(look, lk);
+                    f.mpb.SetTexture("_MainTex", f.ropeTex);
+                    f.mpb.SetColor("_Color", Color.white);
+                }
+                else f.mpb.SetColor("_Color", f.ropeColor);
                 rr.SetPropertyBlock(f.mpb);
                 Cfg.Log("Line colour: " + (sampled ? "from " + lineTriList.Count + " line triangles " : "lineGray ") + "(" + f.ropeColor.r.ToString("F2") + ", " +
-                        f.ropeColor.g.ToString("F2") + ", " + f.ropeColor.b.ToString("F2") + ")");
+                        f.ropeColor.g.ToString("F2") + ", " + f.ropeColor.b.ToString("F2") + ")" +
+                        (look.share > 0f ? ", dark stroke (" + (look.shadow.r * lk).ToString("F2") + ", " + (look.shadow.g * lk).ToString("F2") + ", " +
+                        (look.shadow.b * lk).ToString("F2") + ") on " + (Mathf.Clamp(Mathf.RoundToInt(look.share * 4f), 1, 3) * 12.5f).ToString("F0") + " % of the rope width (original " + (look.share * 100f).ToString("F0") + " %)" : ", one colour"));
                 BuildRopeTopology(f);
             }
 
@@ -2423,7 +2566,7 @@ namespace ChuteFX
                 if (f.ropeR != null)
                 {
                     f.ropeR.GetPropertyBlock(f.mpb);
-                    f.mpb.SetColor("_Color", new Color(f.ropeColor.r * br, f.ropeColor.g * br, f.ropeColor.b * br, 1f));
+                    f.mpb.SetColor("_Color", f.ropeTex != null ? new Color(br, br, br, 1f) : new Color(f.ropeColor.r * br, f.ropeColor.g * br, f.ropeColor.b * br, 1f));
                     f.ropeR.SetPropertyBlock(f.mpb);
                 }
                 if (cen.y < -f.alt - Cfg.waterRemoveDepth) return false;
