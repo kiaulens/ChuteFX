@@ -2,6 +2,8 @@
 
 Parachute cloth effects for Kerbal Space Program 1.12.
 
+![ChuteFX: canopies cut after landing on land and on water](docs/chutefx.gif)
+
 ChuteFX makes stock parachutes look like fabric. Open canopies flutter and breathe in the airflow. A canopy that has
 been cut, either by you or by the automatic cut after landing, is not just deleted: it becomes a simulated piece of
 cloth that drifts down, drapes over the ground or floats on the water, and soaks up water and sinks.
